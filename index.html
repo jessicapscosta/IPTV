@@ -254,6 +254,8 @@
   #player-error{ display:none; position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); z-index:3;
     background:rgba(20,10,12,0.92); border:1px solid var(--accent); color:#fff; padding:16px 22px; border-radius:6px;
     font-family:var(--mono); font-size:12.5px; max-width:520px; text-align:center; line-height:1.6; }
+  #player-loading{ display:none; position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); z-index:3;
+    flex-direction:column; align-items:center; gap:10px; color:var(--dim); font-family:var(--mono); font-size:11.5px; letter-spacing:1px; }
 
   @media(max-width:760px){
     #topbar{ gap:14px; padding:0 4%; }
@@ -350,6 +352,7 @@
     <div id="now-playing"><span class="live-dot"></span><span id="now-playing-text"></span></div>
   </div>
   <div id="player-error"></div>
+  <div id="player-loading"><div class="spinner"></div><span>verificando formato do arquivo...</span></div>
 </div>
 
 <script>
@@ -385,7 +388,9 @@
   const playerOverlay = el('player-overlay');
   const nowPlayingText = el('now-playing-text');
   const playerError = el('player-error');
+  const playerLoading = el('player-loading');
   const topbar = el('topbar');
+  const VOD_EXT_FALLBACKS = ['mp4','mkv','avi','ts','m3u8'];
 
   // ---- persistence ----
   function loadSaved(){
@@ -744,10 +749,22 @@
       });
       extra.innerHTML = html;
       extra.querySelectorAll('.ep-row').forEach(row=>{
-        row.addEventListener('click', ()=>{
-          const url = `${baseUrl()}/series/${state.user}/${state.pass}/${row.dataset.epId}.${row.dataset.ext}`;
+        row.addEventListener('click', async ()=>{
+          const primary = (row.dataset.ext || 'mp4').replace(/^\./,'');
+          const exts = [primary, ...VOD_EXT_FALLBACKS.filter(e => e !== primary)];
+          const candidates = exts.map(ext => `${baseUrl()}/series/${state.user}/${state.pass}/${row.dataset.epId}.${ext}`);
+          const label = `${item.name} — ${row.dataset.name}`;
           closeInfoModal();
-          playStream(url, `${item.name} — ${row.dataset.name}`, false);
+          openPlayerOverlay();
+          nowPlayingText.textContent = label;
+          el('now-playing').querySelector('.live-dot').style.display = 'none';
+          showPlayerLoading();
+          const { url, ok } = await resolvePlayableUrl(candidates);
+          if(!ok){
+            showPlayerError('Não consegui encontrar um formato reproduzível para este episódio (testei: ' + exts.join(', ') + '). Abra esta URL direto no navegador para ver o que o servidor devolve: ' + candidates[0]);
+            return;
+          }
+          playStream(url, label, false);
         });
       });
     }catch(err){
@@ -767,8 +784,33 @@
   }
   el('close-player').addEventListener('click', stopPlayer);
 
-  function showPlayerError(msg){ playerError.textContent = msg; playerError.style.display = 'block'; }
+  function showPlayerError(msg){ hidePlayerLoading(); playerError.textContent = msg; playerError.style.display = 'block'; }
   function hidePlayerError(){ playerError.style.display = 'none'; playerError.textContent=''; }
+  function showPlayerLoading(msg){ hidePlayerError(); playerLoading.querySelector('span').textContent = msg || 'verificando formato do arquivo...'; playerLoading.style.display = 'flex'; }
+  function hidePlayerLoading(){ playerLoading.style.display = 'none'; }
+
+  // Tenta, em sequência, descobrir qual URL entre candidatas realmente devolve
+  // mídia reproduzível (faz uma requisição pequena com Range e olha o
+  // Content-Type/status). Isso contorna o problema comum do Xtream de
+  // devolver "container_extension" errado ou vazio na API de listagem.
+  async function resolvePlayableUrl(urls){
+    for(const url of urls){
+      try{
+        const res = await fetch(url, { headers: { Range: 'bytes=0-256' } });
+        const ct = (res.headers.get('content-type') || '').toLowerCase();
+        const looksLikeMedia = ct.startsWith('video/') || ct.startsWith('audio/') ||
+          ct.includes('mpegurl') || ct.includes('octet-stream') || ct.includes('mp2t');
+        const looksLikeError = ct.includes('text/html') || ct.includes('application/json');
+        if((res.ok || res.status===206) && (looksLikeMedia || (!ct && res.ok))){
+          return { url, ok:true };
+        }
+        if(res.ok && !looksLikeError && !ct){
+          return { url, ok:true };
+        }
+      }catch(e){ /* rede falhou nesta extensão, tenta a próxima */ }
+    }
+    return { url: urls[0], ok:false };
+  }
 
   function describeVideoError(err){
     const map = {
@@ -780,9 +822,18 @@
     return (err && map[err.code]) || 'Erro desconhecido ao reproduzir este conteúdo.';
   }
   function describeHlsError(data){
-    if(data.type === 'networkError') return 'Falha de rede ao buscar o stream (.m3u8). Provavelmente é bloqueio de CORS ou o proxy não está repassando essa rota. Veja o console (F12) para detalhes.';
-    if(data.type === 'mediaError') return 'Erro de mídia ao decodificar o stream ao vivo.';
-    return 'Erro ao carregar o stream via HLS.';
+    let base;
+    if(data.type === 'networkError') base = 'Falha de rede ao buscar o stream ao vivo.';
+    else if(data.type === 'mediaError') base = 'Erro de mídia ao decodificar o stream ao vivo.';
+    else base = 'Erro ao carregar o stream via HLS.';
+
+    const bits = [];
+    if(data.details) bits.push('detalhe: ' + data.details);
+    if(data.response && (data.response.code !== undefined)) bits.push('status HTTP: ' + data.response.code);
+    if(data.url) bits.push('url: ' + data.url);
+
+    if(bits.length===0) return base + ' Veja o console (F12) para mais detalhes.';
+    return base + ' — ' + bits.join(' · ');
   }
 
   video.addEventListener('error', ()=>{
@@ -792,6 +843,7 @@
   function playStream(url, label, isLive){
     openPlayerOverlay();
     hidePlayerError();
+    hidePlayerLoading();
     nowPlayingText.textContent = label;
     el('now-playing').querySelector('.live-dot').style.display = isLive ? 'inline-block' : 'none';
 
@@ -831,9 +883,21 @@
     playStream(url, item.name, true);
   }
 
-  function playVod(item){
-    const ext = item.container_extension || 'mp4';
-    const url = `${baseUrl()}/movie/${state.user}/${state.pass}/${item.stream_id}.${ext}`;
+  async function playVod(item){
+    const primary = (item.container_extension || 'mp4').replace(/^\./,'');
+    const exts = [primary, ...VOD_EXT_FALLBACKS.filter(e => e !== primary)];
+    const candidates = exts.map(ext => `${baseUrl()}/movie/${state.user}/${state.pass}/${item.stream_id}.${ext}`);
+
+    openPlayerOverlay();
+    nowPlayingText.textContent = item.name;
+    el('now-playing').querySelector('.live-dot').style.display = 'none';
+    showPlayerLoading();
+
+    const { url, ok } = await resolvePlayableUrl(candidates);
+    if(!ok){
+      showPlayerError('Não consegui encontrar um formato reproduzível para "' + item.name + '" (testei: ' + exts.join(', ') + '). Abra esta URL direto no navegador para ver o que o servidor devolve: ' + candidates[0]);
+      return;
+    }
     playStream(url, item.name, false);
   }
 
